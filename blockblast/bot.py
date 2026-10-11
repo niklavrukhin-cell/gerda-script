@@ -23,7 +23,7 @@ except ImportError:  # для симулятора на машине без macO
     Quartz = None
 
 WORK = '/tmp/bb'
-SHOT = os.path.join(WORK, 'shot.png')
+SHOT = os.path.join(WORK, 'shot.bmp')
 STOP = os.path.join(WORK, 'stop')
 CALIB = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'calib.json')
 OWNERS = ('Видеоповтор iPhone', 'iPhone Mirroring')
@@ -59,11 +59,9 @@ def snapshot(tag):
     """Копия последнего снимка окна рядом с логом — чтобы потом разобрать, что случилось."""
     if _logf:
         dst = _logf.name[:-4] + f'-{time.strftime("%H%M%S")}-{tag}.png'
-        try:
-            os.replace(SHOT, dst)
+        if _last_img is not None:
+            Image.fromarray(_last_img.astype(np.uint8)).save(dst)
             log('снимок:', os.path.basename(dst))
-        except OSError:
-            pass
 
 
 # ---------------------------------------------------------------- экран / мышь
@@ -77,9 +75,40 @@ def find_window():
     return None, None
 
 
+_last_img = None
+_fast_capture = True
+
+
+def _capture_quartz(wid):
+    """Снимок окна прямо в памяти, без отдельного процесса и PNG — в разы быстрее screencapture."""
+    ref = Quartz.CGWindowListCreateImage(
+        Quartz.CGRectNull, Quartz.kCGWindowListOptionIncludingWindow, wid,
+        Quartz.kCGWindowImageBoundsIgnoreFraming | Quartz.kCGWindowImageBestResolution)
+    if ref is None:
+        return None
+    w, h = Quartz.CGImageGetWidth(ref), Quartz.CGImageGetHeight(ref)
+    bpr = Quartz.CGImageGetBytesPerRow(ref)
+    data = Quartz.CGDataProviderCopyData(Quartz.CGImageGetDataProvider(ref))
+    a = np.frombuffer(data, dtype=np.uint8).reshape(h, bpr // 4, 4)[:, :w]
+    return a[:, :, 2::-1].astype(np.int16)  # BGRA → RGB
+
+
 def capture(wid):
-    subprocess.run(['screencapture', '-x', '-o', '-l', str(wid), SHOT], check=True)
-    return np.asarray(Image.open(SHOT).convert('RGB')).astype(np.int16)
+    global _last_img, _fast_capture
+    img = None
+    if _fast_capture:
+        try:
+            img = _capture_quartz(wid)
+        except Exception as e:
+            log('быстрый снимок не работает, перехожу на screencapture:', e)
+        if img is None or img.max() == 0:
+            _fast_capture = False
+            img = None
+    if img is None:
+        subprocess.run(['screencapture', '-x', '-o', '-t', 'bmp', '-l', str(wid), SHOT], check=True)
+        img = np.asarray(Image.open(SHOT).convert('RGB')).astype(np.int16)
+    _last_img = img
+    return img
 
 
 def mouse_pos():
@@ -92,16 +121,16 @@ def _ev(t, x, y):
                        Quartz.CGEventCreateMouseEvent(None, t, (x, y), Quartz.kCGMouseButtonLeft))
 
 
-def drag(a, b, steps=24, dt=0.008):
+def drag(a, b, steps=16, dt=0.008):
     _ev(Quartz.kCGEventMouseMoved, *a)
-    time.sleep(0.05)
+    time.sleep(0.04)
     _ev(Quartz.kCGEventLeftMouseDown, *a)
-    time.sleep(0.09)
+    time.sleep(0.07)
     for i in range(1, steps + 1):
         t = i / steps
         _ev(Quartz.kCGEventLeftMouseDragged, a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t)
         time.sleep(dt)
-    time.sleep(0.09)
+    time.sleep(0.07)
     _ev(Quartz.kCGEventLeftMouseUp, *b)
 
 
@@ -360,22 +389,41 @@ def save_calib(c):
         json.dump(c, f, indent=1)
 
 
-def stable_state(wid, geom, tries=15, need=3):
+def read_state(wid, geom):
+    img = capture(wid)
+    if not screen_ok(img, geom):
+        return None, None, None
+    return img, read_board(img, geom), read_tray(img, geom)
+
+
+def stable_state(wid, geom, tries=20, need=2):
     """Ждёт, пока картинка успокоится (анимации, надписи «Brilliant Escape» и т.п.).
     Возвращает (img, доска, лоток); (None, None, None) — не игра или не успокоилось."""
     prev, same = None, 0
     for _ in range(tries):
-        img = capture(wid)
-        if not screen_ok(img, geom):
+        img, board, tray = read_state(wid, geom)
+        if img is None:
             return None, None, None
-        tray = read_tray(img, geom)
-        st = (read_board(img, geom), tuple(s and s[0] for s in tray))
+        st = (board, tuple(s and s[0] for s in tray))
         same = same + 1 if st == prev else 1
         if same >= need:
-            return img, st[0], tray
+            return img, board, tray
         prev = st
-        time.sleep(0.2)
+        time.sleep(0.12)
     return None, None, None
+
+
+def wait_board(wid, geom, expected, slot, timeout):
+    """После хода: часто снимает экран, пока поле не станет ожидаемым, а фигура не уйдёт из лотка.
+    Совпадение с заранее посчитанным полем — надёжная проверка, ждать «успокоения» не нужно."""
+    end = time.time() + timeout
+    while True:
+        img, board, tray = read_state(wid, geom)
+        if img is not None and board == expected and tray[slot] is None:
+            return img, board, tray
+        if time.time() > end:
+            return None, None, None
+        time.sleep(0.03)
 
 
 def main():
@@ -409,6 +457,7 @@ def main():
     idle_since = None
     warned = False
     fails = 0
+    state = None  # уже проверенное состояние после прошлого хода — не снимаем заново
 
     while moves < args.moves:
         if os.path.exists(STOP):
@@ -423,7 +472,8 @@ def main():
         if not wid:
             log('окно пропало')
             break
-        img, board, tray = stable_state(wid, geom)
+        img, board, tray = state or stable_state(wid, geom)
+        state = None
         pieces = {i: s[0] for i, s in enumerate(tray) if s} if img is not None else {}
         if not pieces:
             # фигур нет: идёт анимация, или вылезло окно/реклама, или отвалился Видеоповтор
@@ -464,7 +514,14 @@ def main():
         last_mouse = b
         moves += 1
         expected, cleared = apply(board, m)
-        time.sleep(1.1 if cleared else 0.35)  # после сноса линий поверх поля летят надписи
+        img2, board2, tray2 = wait_board(wid, geom, expected, s, 2.5 if cleared else 1.2)
+        if img2 is not None:
+            fails = 0
+            # остальные фигуры лежат на месте — сразу ходим дальше;
+            # если лоток опустел, новые фигуры ещё выезжают — их прочитаем после успокоения
+            if any(tray2):
+                state = (img2, board2, tray2)
+            continue
         img2, board2, tray2 = stable_state(wid, geom)
         if img2 is None:
             continue
