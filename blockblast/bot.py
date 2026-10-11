@@ -173,6 +173,23 @@ def screen_ok(img, geom):
     return np.median(d) > 4
 
 
+def _largest_group(cells):
+    """Фигура — связный кусок; лишние клетки в стороне (мусор на экране) отбрасываем."""
+    left, best = set(cells), []
+    while left:
+        stack, group = [left.pop()], []
+        while stack:
+            r, c = stack.pop()
+            group.append((r, c))
+            for n in ((r + 1, c), (r - 1, c), (r, c + 1), (r, c - 1)):
+                if n in left:
+                    left.remove(n)
+                    stack.append(n)
+        if len(group) > len(best):
+            best = group
+    return best
+
+
 def read_tray(img, geom):
     """Три слота под полем. Для каждого: None или (cells, (cx, cy) центр в px, (h, w))."""
     x0, y0, cell = geom
@@ -209,12 +226,17 @@ def read_tray(img, geom):
                 px, py = int(bx0 + (j + .5) * cw), int(by0 + (i + .5) * ch)
                 if sub[py - k:py + k, px - k:px + k].mean() > 0.5:
                     cells.append((i, j))
+        cells = _largest_group(cells)
         if not cells:
             slots.append(None)
             continue
-        cx = sx0 + bx0 + nw * cw / 2
-        cy = ty0 + by0 + nh * ch / 2
-        slots.append((tuple(cells), (cx, cy), (nh, nw)))
+        # мусор рядом (летящие очки, конфетти) раздувает рамку — обрезаем пустые ряды/столбцы
+        r0, c0 = min(r for r, _ in cells), min(c for _, c in cells)
+        r1, c1 = max(r for r, _ in cells), max(c for _, c in cells)
+        cx = sx0 + bx0 + (c0 + c1 + 1) / 2 * cw
+        cy = ty0 + by0 + (r0 + r1 + 1) / 2 * ch
+        cells = tuple(sorted((r - r0, c - c0) for r, c in cells))
+        slots.append((cells, (cx, cy), (r1 - r0 + 1, c1 - c0 + 1)))
     return slots
 
 
@@ -469,6 +491,7 @@ def main():
     idle_since = None
     warned = False
     fails = 0
+    last_shift = None
     state = None  # уже проверенное состояние после прошлого хода — не снимаем заново
 
     while moves < args.moves:
@@ -529,6 +552,7 @@ def main():
         img2, board2, tray2 = wait_board(wid, geom, expected, s, 2.5 if cleared else 1.2)
         if img2 is not None:
             fails = 0
+            last_shift = None
             # остальные фигуры лежат на месте — сразу ходим дальше;
             # если лоток опустел, новые фигуры ещё выезжают — их прочитаем после успокоения
             if any(tray2):
@@ -539,6 +563,7 @@ def main():
             continue
         if board2 == expected:
             fails = 0
+            last_shift = None
             continue
         if tray2[s] is not None and board2 == board:
             fails += 1
@@ -550,15 +575,26 @@ def main():
             continue
         fails = 0
         # фигура встала со сдвигом? ищем такую же фигуру рядом и правим калибровку
+        # Правим, только если сдвиг повторился два хода подряд в ту же сторону (одиночный —
+        # скорее ошибка чтения), и не дальше чем на клетку от замеренных значений.
+        shift = None
         for dr, dc in itertools.product((-1, 0, 1), repeat=2):
             if dr == dc == 0:
                 continue
             for mm, rr, cc in placements(cells):
                 if rr == r0 + dr and cc == c0 + dc and not board & mm and apply(board, mm)[0] == board2:
-                    calib['lift_x'] -= dc * 0.5
-                    calib['lift_y'] -= dr * 0.5
-                    save_calib(calib)
-                    log(f'встала со сдвигом ({dr},{dc}), правлю калибровку → {calib}')
+                    shift = (dr, dc)
+        if shift:
+            log(f'встала со сдвигом {shift}')
+            if shift == last_shift:
+                dr, dc = shift
+                # легла ниже/правее, чем надо → фигура смещена от пальца сильнее в ту же сторону
+                calib['lift_x'] = min(max(calib['lift_x'] + dc * 0.3, DEFAULT_CALIB['lift_x'] - 1), DEFAULT_CALIB['lift_x'] + 1)
+                calib['lift_y'] = min(max(calib['lift_y'] + dr * 0.3, DEFAULT_CALIB['lift_y'] - 1), DEFAULT_CALIB['lift_y'] + 1)
+                save_calib(calib)
+                log(f'сдвиг повторился — правлю калибровку → {calib}')
+                shift = None
+        last_shift = shift
         if board2 != expected:
             log('доска отличается от ожидаемой, перечитываю\nждал:\n' + fmt(expected) + '\nвижу:\n' + fmt(board2))
             snapshot('ne-to')
