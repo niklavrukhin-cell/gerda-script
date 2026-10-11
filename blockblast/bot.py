@@ -133,6 +133,19 @@ def read_board(img, geom):
     return bits
 
 
+def screen_ok(img, geom):
+    """Похоже ли на игру: пустые клетки поля заметно темнее фона под полем.
+    Отсекает «iPhone используется», «Подключение прервано» и т.п."""
+    x0, y0, cell = geom
+    yb = y0 + N * cell
+    strip = lum(img[int(yb + 0.2 * cell):int(yb + 0.35 * cell), int(x0):int(x0 + N * cell)])
+    r = max(2, int(cell * 0.18))
+    darkest = min(lum(img[int(y0 + (i + .5) * cell) - r:int(y0 + (i + .5) * cell) + r,
+                          int(x0 + (j + .5) * cell) - r:int(x0 + (j + .5) * cell) + r]).mean()
+                  for i in range(N) for j in range(N))
+    return np.median(strip) - darkest > 20
+
+
 def read_tray(img, geom):
     """Три слота под полем. Для каждого: None или (cells, (cx, cy) центр в px, (h, w))."""
     x0, y0, cell = geom
@@ -350,13 +363,19 @@ def save_calib(c):
         json.dump(c, f, indent=1)
 
 
-def stable_state(wid, geom, tries=12):
-    prev = None
+def stable_state(wid, geom, tries=15, need=3):
+    """Ждёт, пока картинка успокоится (анимации, надписи «Brilliant Escape» и т.п.).
+    Возвращает (img, доска, лоток); (None, None, None) — не игра или не успокоилось."""
+    prev, same = None, 0
     for _ in range(tries):
         img = capture(wid)
-        st = (read_board(img, geom), tuple(s and s[0] for s in read_tray(img, geom)))
-        if st == prev:
-            return img, st[0], read_tray(img, geom)
+        if not screen_ok(img, geom):
+            return None, None, None
+        tray = read_tray(img, geom)
+        st = (read_board(img, geom), tuple(s and s[0] for s in tray))
+        same = same + 1 if st == prev else 1
+        if same >= need:
+            return img, st[0], tray
         prev = st
         time.sleep(0.2)
     return None, None, None
@@ -407,21 +426,17 @@ def main():
             log('окно пропало')
             break
         img, board, tray = stable_state(wid, geom)
-        if img is None:
-            log('картинка не успокаивается, жду')
-            time.sleep(0.5)
-            continue
-        pieces = {i: s[0] for i, s in enumerate(tray) if s}
+        pieces = {i: s[0] for i, s in enumerate(tray) if s} if img is not None else {}
         if not pieces:
             # фигур нет: идёт анимация, или вылезло окно/реклама, или отвалился Видеоповтор
             idle_since = idle_since or time.time()
             idle = time.time() - idle_since
             if idle > 8 and not warned:
-                log('фигур не видно 8 с — что-то на экране (реклама? «Подключение прервано»?)')
+                log('игры не видно 8 с — реклама, «iPhone используется» или «Подключение прервано»? жду')
                 snapshot('net-figur')
                 warned = True
             if idle > 120:
-                log('2 минуты без фигур — выхожу')
+                log('2 минуты без игры — выхожу')
                 break
             time.sleep(0.5)
             continue
@@ -450,8 +465,8 @@ def main():
         drag(a, b)
         last_mouse = b
         moves += 1
-        expected, _ = apply(board, m)
-        time.sleep(0.35)
+        expected, cleared = apply(board, m)
+        time.sleep(1.1 if cleared else 0.35)  # после сноса линий поверх поля летят надписи
         img2, board2, tray2 = stable_state(wid, geom)
         if img2 is None or board2 == expected:
             continue
