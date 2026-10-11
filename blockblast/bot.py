@@ -17,7 +17,10 @@ import time
 
 import numpy as np
 from PIL import Image
-import Quartz
+try:
+    import Quartz
+except ImportError:  # для симулятора на машине без macOS
+    Quartz = None
 
 WORK = '/tmp/bb'
 SHOT = os.path.join(WORK, 'shot.png')
@@ -28,7 +31,7 @@ OWNERS = ('Видеоповтор iPhone', 'iPhone Mirroring')
 # Механика перетаскивания (замерено): центр фигуры = точка касания + LIFT*cell
 # + GAIN*(мышь - точка касания). То есть фигура висит над пальцем и едет в 1.5 раза быстрее.
 DEFAULT_CALIB = {'gain': 1.5, 'lift_x': 0.0, 'lift_y': -2.26}
-# Геометрия поля в долях окна (запасной вариант, если автопоиск не сработал).
+# Геометрия поля в долях окна «Видеоповтора» (одинакова во всех темах игры).
 DEFAULT_BOARD = (50 / 632, 381 / 1392, 532 / 632)
 TRAY_CELL = 0.459  # размер клетки фигуры в лотке относительно клетки поля
 
@@ -39,8 +42,27 @@ COL = [sum(1 << (r * 8 + c) for r in range(N)) for c in range(N)]
 NOT_C0, NOT_C7 = FULL & ~COL[0], FULL & ~COL[7]
 
 
+LOG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'logs')
+_logf = None
+
+
 def log(*a):
-    print(time.strftime('%H:%M:%S'), *a, flush=True)
+    line = ' '.join(str(x) for x in (time.strftime('%H:%M:%S'),) + a)
+    print(line, flush=True)
+    if _logf:
+        _logf.write(line + '\n')
+        _logf.flush()
+
+
+def snapshot(tag):
+    """Копия последнего снимка окна рядом с логом — чтобы потом разобрать, что случилось."""
+    if _logf:
+        dst = _logf.name[:-4] + f'-{time.strftime("%H%M%S")}-{tag}.png'
+        try:
+            os.replace(SHOT, dst)
+            log('снимок:', os.path.basename(dst))
+        except OSError:
+            pass
 
 
 # ---------------------------------------------------------------- экран / мышь
@@ -88,26 +110,6 @@ def lum(img):
     return img.mean(axis=2)
 
 
-def detect_board(img):
-    """Ищет поле по тёмным линиям сетки. Возвращает (x0, y0, cell) в пикселях снимка."""
-    H, W, _ = img.shape
-    L = lum(img)
-    m = (L > 30) & (L < 130)
-    m[:int(.15 * H)] = False
-    m[int(.75 * H):] = False
-    xs = np.nonzero(m.sum(0) > H * 0.15)[0]
-    if len(xs) < 2:
-        return None
-    x0, x1 = xs.min(), xs.max()
-    size = x1 - x0 + 1
-    if not (0.6 * W < size < 0.98 * W):
-        return None
-    ys = np.nonzero(m[:, x0:x1].sum(1) > size * 0.3)[0]
-    if not len(ys):
-        return None
-    return float(x0), float(ys.min()), size / N
-
-
 def read_board(img, geom):
     x0, y0, cell = geom
     r = max(2, int(cell * 0.18))
@@ -116,11 +118,13 @@ def read_board(img, geom):
         for j in range(N):
             cx, cy = int(x0 + (j + .5) * cell), int(y0 + (i + .5) * cell)
             vals[i, j] = lum(img[cy - r:cy + r, cx - r:cx + r]).mean()
-    lo, hi = np.percentile(vals, 5), vals.max()
-    if hi - lo < 30:  # всё поле одного цвета
+    # пустые клетки тёмные, фигуры светлые: режем по самому большому скачку яркости
+    v = np.sort(vals.ravel())
+    k = int(np.argmax(np.diff(v)))
+    if v[k + 1] - v[k] > 35:
+        filled = vals > (v[k] + v[k + 1]) / 2
+    else:  # всё поле одного цвета
         filled = vals > 120
-    else:
-        filled = vals > lo + max(30, (hi - lo) * 0.35)
     bits = 0
     for i in range(N):
         for j in range(N):
@@ -133,7 +137,7 @@ def read_tray(img, geom):
     """Три слота под полем. Для каждого: None или (cells, (cx, cy) центр в px, (h, w))."""
     x0, y0, cell = geom
     H, W, _ = img.shape
-    ty0 = int(y0 + N * cell + 0.4 * cell)
+    ty0 = int(y0 + N * cell + 0.5 * cell)
     ty1 = int(min(H, y0 + N * cell + 4.8 * cell))
     reg = img[ty0:ty1]
     bg = np.median(reg[:, int(x0):int(x0 + N * cell)].reshape(-1, 3), axis=0)
@@ -224,7 +228,32 @@ def _runs_v(f, n):
     return r
 
 
+# Веса признаков доски (подобраны симулятором sim.py).
+WEIGHTS = {
+    'free': 1.0,      # свободные клетки
+    'perim': -0.9,    # границы пустых клеток с занятыми/стенами — «изрезанность»
+    'holes': -12.0,   # одиночные дырки, закрытые со всех сторон
+    'pockets': -2.5,  # клетки, закрытые с трёх сторон
+    'sq3': 39.0,      # влезает 3×3
+    'h5': 22.0,       # влезает 1×5
+    'v5': 22.0,       # влезает 5×1
+    'sq2': 44.0,      # влезает 2×2
+    'rect23': 13.0,   # влезает 2×3 или 3×2
+    'n_sq3': 1.2,     # сколько мест под 3×3 (до 6)
+    'n_5': 0.6,       # сколько мест под 1×5/5×1 (до 8)
+}
+# Награда за снос линий в серии: за линию, за несколько сразу, за комбо подряд.
+GAIN = {'line': 10.0, 'multi': 10.0, 'streak': 6.0}
+FEATS = tuple(WEIGHTS)
+_W = [WEIGHTS[k] for k in FEATS]
 _EVAL = {}
+
+
+def set_weights(w):
+    global _W
+    WEIGHTS.update(w)
+    _W = [WEIGHTS[k] for k in FEATS]
+    _EVAL.clear()
 
 
 def evaluate(b):
@@ -232,12 +261,12 @@ def evaluate(b):
     if v is None:
         if len(_EVAL) > 2_000_000:
             _EVAL.clear()
-        v = _EVAL[b] = _evaluate(b)
+        v = _EVAL[b] = sum(w * f for w, f in zip(_W, features(b)))
     return v
 
 
-def _evaluate(b):
-    """Чем больше, тем лучше доска для следующих (неизвестных) фигур."""
+def features(b):
+    """Признаки доски в порядке FEATS."""
     free = FULL & ~b
     L = ((b << 1) & NOT_C0 & FULL) | COL[0]
     R = ((b >> 1) & NOT_C7) | COL[7]
@@ -245,20 +274,15 @@ def _evaluate(b):
     D = (b >> 8) | ROW[7]
     perim = popcount(free & L) + popcount(free & R) + popcount(free & U) + popcount(free & D)
     holes = popcount(free & L & R & U & D)
-    # «карманы» в одну клетку шириной с трёх сторон закрытые
     pockets = popcount(free & L & R & U) + popcount(free & L & R & D) \
         + popcount(free & U & D & L) + popcount(free & U & D & R) - 4 * holes
-    h3, h5 = _runs_h(free, 3), _runs_h(free, 5)
+    h2, h3, h5 = _runs_h(free, 2), _runs_h(free, 3), _runs_h(free, 5)
     sq3 = _runs_v(h3, 3)
-    h2 = _runs_h(free, 2)
     sq2 = _runs_v(h2, 2)
     v5 = _runs_v(free, 5)
     rect23 = _runs_v(h3, 2) | _runs_v(h2, 3)
-    score = popcount(free) * 1.0 - perim * 0.9 - holes * 12 - pockets * 2.5
-    score += (14 if sq3 else -25) + (8 if h5 else -14) + (8 if v5 else -14)
-    score += (4 if sq2 else -40) + (3 if rect23 else -10)
-    score += min(popcount(sq3), 6) * 1.2 + min(popcount(h5) + popcount(v5), 8) * 0.6
-    return score
+    return (popcount(free), perim, holes, pockets, sq3 != 0, h5 != 0, v5 != 0, sq2 != 0,
+            rect23 != 0, min(popcount(sq3), 6), min(popcount(h5) + popcount(v5), 8))
 
 
 def plan(board, pieces):
@@ -278,7 +302,8 @@ def plan(board, pieces):
                 if b & m:
                     continue
                 nb, lines = apply(b, m)
-                gain = lines * 10 + (lines * (lines - 1)) * 10 + (streak * 6 if lines else 0)
+                gain = (GAIN['line'] * lines + GAIN['multi'] * lines * (lines - 1)
+                        + GAIN['streak'] * streak) if lines else 0
                 moved = True
                 rec(nb, left - {s}, acc + gain, seq + [(s, m, r0, c0)], streak + 1 if lines else 0)
         if not moved or not left:
@@ -292,6 +317,22 @@ def plan(board, pieces):
 
 def fmt(b):
     return '\n'.join(''.join('#' if b >> (r * 8 + c) & 1 else '.' for c in range(N)) for r in range(N))
+
+
+def fmt_turn(board, pieces, seq):
+    """Поле (куда встанет первый ход — цифрой слота) и фигуры в лотке, всё текстом."""
+    s, m, _, _ = seq[0]
+    rows = [''.join(str(s) if m >> (r * 8 + c) & 1 else '#' if board >> (r * 8 + c) & 1 else '.'
+                    for c in range(N)) for r in range(N)]
+    shapes = []
+    for k, cells in sorted(pieces.items()):
+        h = max(r for r, _ in cells) + 1
+        w = max(c for _, c in cells) + 1
+        shapes.append([f'{k}:' + ''.join('#' if (r, c) in cells else '.' for c in range(w)) if r == 0 else
+                       '  ' + ''.join('#' if (r, c) in cells else '.' for c in range(w)) for r in range(h)])
+    for i in range(max(len(x) for x in shapes)):
+        rows[i] += '   ' + '  '.join((x[i] if i < len(x) else '').ljust(8) for x in shapes)
+    return '\n'.join(rows)
 
 
 # ---------------------------------------------------------------- основной цикл
@@ -326,7 +367,11 @@ def main():
     ap.add_argument('--moves', type=int, default=100000, help='максимум ходов')
     ap.add_argument('--dry', action='store_true', help='только распознать и показать план')
     args = ap.parse_args()
+    global _logf
     os.makedirs(WORK, exist_ok=True)
+    os.makedirs(LOG_DIR, exist_ok=True)
+    _logf = open(os.path.join(LOG_DIR, time.strftime('%Y%m%d-%H%M%S') + '.log'), 'w')
+    log('лог:', _logf.name)
     if os.path.exists(STOP):
         os.remove(STOP)
 
@@ -338,15 +383,15 @@ def main():
     img = capture(wid)
     H, W, _ = img.shape
     scale = W / wb['Width']
-    geom = detect_board(img)
-    if not geom:
-        rx, ry, rs = DEFAULT_BOARD
-        geom = (rx * W, ry * H, rs * W / N)
-        log('поле не нашёл, беру стандартную геометрию')
+    # Раскладка игры одинакова во всех темах, поэтому берём геометрию поля в долях окна.
+    rx, ry, rs = DEFAULT_BOARD
+    geom = (rx * W, ry * H, rs * W / N)
     log('окно', dict(wb), 'поле px', tuple(round(v, 1) for v in geom))
     calib = load_calib()
     last_mouse = None
     moves = 0
+    idle_since = None
+    warned = False
 
     while moves < args.moves:
         if os.path.exists(STOP):
@@ -368,18 +413,30 @@ def main():
             continue
         pieces = {i: s[0] for i, s in enumerate(tray) if s}
         if not pieces:
-            time.sleep(0.3)
+            # фигур нет: идёт анимация, или вылезло окно/реклама, или отвалился Видеоповтор
+            idle_since = idle_since or time.time()
+            idle = time.time() - idle_since
+            if idle > 8 and not warned:
+                log('фигур не видно 8 с — что-то на экране (реклама? «Подключение прервано»?)')
+                snapshot('net-figur')
+                warned = True
+            if idle > 120:
+                log('2 минуты без фигур — выхожу')
+                break
+            time.sleep(0.5)
             continue
+        idle_since = None
+        warned = False
         t0 = time.time()
         val, seq = plan(board, pieces)
         if not seq:
-            log('ни одна фигура не влезает — игра окончена')
-            print(fmt(board))
+            log('ни одна фигура не влезает — игра окончена\n' + fmt(board))
+            snapshot('konec')
             break
         s, m, r0, c0 = seq[0]
         cells, (tx, ty), (nh, nw) = tray[s]
         log(f'ход {moves + 1}: слот {s} → ряд {r0} кол {c0}; план {len(seq)}/{len(pieces)}, '
-            f'оценка {val:.1f}, {time.time() - t0:.2f}с')
+            f'оценка {val:.1f}, {time.time() - t0:.2f}с\n' + fmt_turn(board, pieces, seq))
         if args.dry:
             print(fmt(board), '\nфигуры:', pieces, '\nплан:', [(a, b, c) for a, _, b, c in seq])
             break
@@ -400,6 +457,7 @@ def main():
             continue
         if tray2[s] is not None and board2 == board:
             log('фигура не встала (вернулась в лоток)')
+            snapshot('ne-vstala')
             continue
         # фигура встала со сдвигом? ищем такую же фигуру рядом и правим калибровку
         for dr, dc in itertools.product((-1, 0, 1), repeat=2):
@@ -412,7 +470,8 @@ def main():
                     save_calib(calib)
                     log(f'встала со сдвигом ({dr},{dc}), правлю калибровку → {calib}')
         if board2 != expected:
-            log('доска отличается от ожидаемой, перечитываю')
+            log('доска отличается от ожидаемой, перечитываю\nждал:\n' + fmt(expected) + '\nвижу:\n' + fmt(board2))
+            snapshot('ne-to')
     log(f'сделано ходов: {moves}')
 
 
