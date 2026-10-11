@@ -436,6 +436,14 @@ def main():
     args = ap.parse_args()
     global _logf
     os.makedirs(WORK, exist_ok=True)
+    pidfile = os.path.join(WORK, 'bot.pid')
+    try:
+        os.kill(int(open(pidfile).read()), 0)
+        sys.exit('Бот уже запущен в другом окне — два бота мешают друг другу.')
+    except (OSError, ValueError):
+        pass
+    with open(pidfile, 'w') as f:
+        f.write(str(os.getpid()))
     os.makedirs(LOG_DIR, exist_ok=True)
     _logf = open(os.path.join(LOG_DIR, time.strftime('%Y%m%d-%H%M%S') + '.log'), 'w')
     log('лог:', _logf.name)
