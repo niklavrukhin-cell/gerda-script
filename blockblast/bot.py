@@ -159,17 +159,18 @@ def read_board(img, geom):
 
 
 def screen_ok(img, geom):
-    """Похоже ли на игру: пустые клетки поля заметно отличаются по яркости от фона под полем
-    (в светлых темах они темнее фона, в чёрной — светлее).
-    Отсекает «iPhone используется», «Подключение прервано» и т.п."""
+    """Похоже ли на игру: на месте поля видна сетка — на границах клеток яркость прыгает.
+    На «iPhone используется», «Подключение прервано» и т.п. там ровная заливка."""
     x0, y0, cell = geom
-    yb = y0 + N * cell
-    strip = lum(img[int(yb + 0.2 * cell):int(yb + 0.35 * cell), int(x0):int(x0 + N * cell)])
-    r = max(2, int(cell * 0.18))
-    darkest = min(lum(img[int(y0 + (i + .5) * cell) - r:int(y0 + (i + .5) * cell) + r,
-                          int(x0 + (j + .5) * cell) - r:int(x0 + (j + .5) * cell) + r]).mean()
-                  for i in range(N) for j in range(N))
-    return abs(np.median(strip) - darkest) > 12
+    L = lum(img)
+    d = []
+    for i in range(N):
+        cy = int(y0 + (i + .5) * cell)
+        for j in range(1, N):
+            xb, cx = int(x0 + j * cell), int(x0 + (j - .5) * cell)
+            line = L[cy - 3:cy + 4, xb - 3:xb + 4].min(axis=1).mean()
+            d.append(abs(L[cy - 3:cy + 4, cx - 3:cx + 4].mean() - line))
+    return np.median(d) > 4
 
 
 def read_tray(img, geom):
