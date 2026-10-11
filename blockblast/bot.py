@@ -177,7 +177,7 @@ def read_tray(img, geom):
     x0, y0, cell = geom
     H, W, _ = img.shape
     ty0 = int(y0 + N * cell + 0.5 * cell)
-    ty1 = int(min(H, y0 + N * cell + 4.8 * cell))
+    ty1 = int(min(H, y0 + N * cell + 4.0 * cell))  # ниже бывает рекламный баннер
     reg = img[ty0:ty1]
     bg = np.median(reg[:, int(x0):int(x0 + N * cell)].reshape(-1, 3), axis=0)
     mask = np.abs(reg - bg).sum(axis=2) > TRAY_DIFF
@@ -192,6 +192,9 @@ def read_tray(img, geom):
             slots.append(None)
             continue
         bx0, bx1, by0, by1 = xs.min(), xs.max() + 1, ys.min(), ys.max() + 1
+        if bx0 == 0 or bx1 == sx1 - sx0 or by0 == 0 or by1 == ty1 - ty0:
+            slots.append(None)  # упирается в край слота — это не фигура (баннер, всплывашка)
+            continue
         nw = max(1, int(round((bx1 - bx0) / tc - 0.13)))
         nh = max(1, int(round((by1 - by0) / tc - 0.13)))
         if nw > 5 or nh > 5:
