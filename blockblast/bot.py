@@ -34,6 +34,7 @@ DEFAULT_CALIB = {'gain': 1.5, 'lift_x': 0.0, 'lift_y': -2.26}
 # Геометрия поля в долях окна «Видеоповтора» (одинакова во всех темах игры).
 DEFAULT_BOARD = (50 / 632, 381 / 1392, 532 / 632)
 TRAY_CELL = 0.459  # размер клетки фигуры в лотке относительно клетки поля
+TRAY_DIFF = 28  # насколько цвет пикселя должен отличаться от фона лотка (сумма по RGB)
 
 N = 8
 FULL = (1 << 64) - 1
@@ -111,24 +112,19 @@ def lum(img):
 
 
 def read_board(img, geom):
+    """Клетка занята, если у неё есть объёмная рамка фигуры: верхний край заметно светлее нижнего.
+    Пустые клетки плоские. Работает в любой теме, цвет фигур и поля не важен."""
     x0, y0, cell = geom
-    r = max(2, int(cell * 0.18))
-    vals = np.zeros((N, N))
-    for i in range(N):
-        for j in range(N):
-            cx, cy = int(x0 + (j + .5) * cell), int(y0 + (i + .5) * cell)
-            vals[i, j] = lum(img[cy - r:cy + r, cx - r:cx + r]).mean()
-    # пустые клетки тёмные, фигуры светлые: режем по самому большому скачку яркости
-    v = np.sort(vals.ravel())
-    k = int(np.argmax(np.diff(v)))
-    if v[k + 1] - v[k] > 35:
-        filled = vals > (v[k] + v[k + 1]) / 2
-    else:  # всё поле одного цвета
-        filled = vals > 120
+    L = lum(img)
+    k = int(cell * 0.38)
+    hw = k // 2
     bits = 0
     for i in range(N):
         for j in range(N):
-            if filled[i, j]:
+            cx, cy = int(x0 + (j + .5) * cell), int(y0 + (i + .5) * cell)
+            top = L[cy - k:cy - k + 4, cx - hw:cx + hw].mean()
+            bottom = L[cy + k - 4:cy + k, cx - hw:cx + hw].mean()
+            if top - bottom > 20:
                 bits |= 1 << (i * 8 + j)
     return bits
 
@@ -155,7 +151,7 @@ def read_tray(img, geom):
     ty1 = int(min(H, y0 + N * cell + 4.8 * cell))
     reg = img[ty0:ty1]
     bg = np.median(reg[:, int(x0):int(x0 + N * cell)].reshape(-1, 3), axis=0)
-    mask = np.abs(reg - bg).sum(axis=2) > 60
+    mask = np.abs(reg - bg).sum(axis=2) > TRAY_DIFF
     tc = cell * TRAY_CELL
     slots = []
     bw = N * cell / 3
@@ -412,6 +408,7 @@ def main():
     moves = 0
     idle_since = None
     warned = False
+    fails = 0
 
     while moves < args.moves:
         if os.path.exists(STOP):
@@ -469,12 +466,20 @@ def main():
         expected, cleared = apply(board, m)
         time.sleep(1.1 if cleared else 0.35)  # после сноса линий поверх поля летят надписи
         img2, board2, tray2 = stable_state(wid, geom)
-        if img2 is None or board2 == expected:
+        if img2 is None:
+            continue
+        if board2 == expected:
+            fails = 0
             continue
         if tray2[s] is not None and board2 == board:
-            log('фигура не встала (вернулась в лоток)')
+            fails += 1
+            log(f'фигура не встала (вернулась в лоток), подряд: {fails}')
             snapshot('ne-vstala')
+            if fails >= 3:
+                log('3 раза подряд не встаёт — видимо, неверно читаю экран, останавливаюсь')
+                break
             continue
+        fails = 0
         # фигура встала со сдвигом? ищем такую же фигуру рядом и правим калибровку
         for dr, dc in itertools.product((-1, 0, 1), repeat=2):
             if dr == dc == 0:
