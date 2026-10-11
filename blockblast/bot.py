@@ -134,7 +134,8 @@ def read_board(img, geom):
 
 
 def screen_ok(img, geom):
-    """Похоже ли на игру: пустые клетки поля заметно темнее фона под полем.
+    """Похоже ли на игру: пустые клетки поля заметно отличаются по яркости от фона под полем
+    (в светлых темах они темнее фона, в чёрной — светлее).
     Отсекает «iPhone используется», «Подключение прервано» и т.п."""
     x0, y0, cell = geom
     yb = y0 + N * cell
@@ -143,7 +144,7 @@ def screen_ok(img, geom):
     darkest = min(lum(img[int(y0 + (i + .5) * cell) - r:int(y0 + (i + .5) * cell) + r,
                           int(x0 + (j + .5) * cell) - r:int(x0 + (j + .5) * cell) + r]).mean()
                   for i in range(N) for j in range(N))
-    return np.median(strip) - darkest > 20
+    return abs(np.median(strip) - darkest) > 12
 
 
 def read_tray(img, geom):
