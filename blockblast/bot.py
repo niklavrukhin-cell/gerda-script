@@ -355,7 +355,7 @@ def main():
         if last_mouse:
             mx, my = mouse_pos()
             if abs(mx - last_mouse[0]) + abs(my - last_mouse[1]) > 25:
-                log('мышь сдвинули — останавливаюсь')
+                log(f'мышь сдвинули ({mx:.0f},{my:.0f} вместо {last_mouse[0]:.0f},{last_mouse[1]:.0f}) — останавливаюсь')
                 break
         wid, wb = find_window()
         if not wid:
